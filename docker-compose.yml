@@ -1,0 +1,20 @@
+# Имитация окружения JupyterHub для локального тестирования reverse proxy.
+#
+# Nginx слушает 8080 и проксирует префикс /user/my_login/proxy/8000/
+# (как это делает реальный jupyter-server-proxy) на FastAPI, запущенный
+# на localhost:8000 хоста. Само приложение (main.py) запускается как обычно
+# (например, из jupyter-ноутбука через proxy_runner.start_proxy) — контейнер
+# нужен только для теста.
+#
+#   docker compose up -d      # поднять имитацию
+#   docker compose down       # убрать
+
+services:
+  nginx:
+    image: nginx:1.31.5-alpine
+    container_name: jupyterhub-imitation
+    # Linux: контейнер в сети хоста, чтобы nginx видел FastAPI на 127.0.0.1:8000
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped

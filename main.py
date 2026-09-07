@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Локальный reverse proxy: ретранслирует реальный сайт (SPA, напр. ChatGPT) на localhost.
+Локальный reverse proxy: ретранслирует реальный сайт (напр. Wikipedia) на localhost.
 
 Что умеет:
   * Catch-all HTTP-проксирование всех методов и путей (FastAPI + httpx)
@@ -9,7 +9,10 @@
   * Перехват редиректов 3xx с переписыванием Location (follow_redirects=False)
   * URL rewriting в HTML/JS/CSS/JSON/SSE: https://, http://, //, wss://, ws://,
     экранированные (https:\\/\\/site) и URL-encoded (https%3A%2F%2Fsite) варианты,
-    а также «голый» домен для JS-проверок вида location.host === "chatgpt.com"
+    «голый» домен, а также root-relative ссылки (/wiki/X, fetch("/api/...")) в
+    HTML-атрибутах, CSS url(), JS-вызовах и JSON-объектах
+  * Работа под префиксом JupyterHub (BASE_PATH): uvicorn получает root_path,
+    а все ссылки переписываются с учётом базового пути
   * Удаление CSP / X-Frame-Options / HSTS и прочих блокирующих заголовков
   * Двусторонний WebSocket-прокси (текст + бинарные фреймы, subprotocols)
   * Дополнительные домены (CDN/SSO) через path-префикс /__<домен>__/<путь>
@@ -18,9 +21,10 @@
     uvicorn main:app --port 8000
     python main.py                      # эквивалентно
 
-Конфигурация через окружение:
-    TARGET_URL=https://chatgpt.com      # основной целевой сайт
+Конфигурация — файл config.txt / переменные окружения (см. config.py):
+    TARGET_URL=     # основной целевой сайт (по умолчанию https://ru.wikipedia.org)
     EXTRA_TARGET_DOMAINS=a.com,b.com    # доп. домены (CDN/SSO), можно пустой строкой
+    BASE_PATH=/user/my_login/proxy/8000 # префикс JupyterHub (пусто = обычный localhost)
     DEBUG=1                             # подробные логи
 """
 
@@ -28,8 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
+from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from functools import lru_cache
 from urllib.parse import quote, urlparse
@@ -41,30 +45,19 @@ from fastapi.responses import Response, StreamingResponse
 from websockets.exceptions import ConnectionClosed
 
 # ---------------------------------------------------------------------------
-# Конфигурация
+# Конфигурация (config.py читает config.txt и переменные окружения)
 # ---------------------------------------------------------------------------
 
-TARGET_URL = os.environ.get("TARGET_URL", "https://chatgpt.com").rstrip("/")
-
-# Домены, которые SPA дополнительно использует для ассетов/логина (CDN, SSO).
-# Каждый из них доступен через прокси по пути /__<домен>__/<путь>.
-EXTRA_TARGET_DOMAINS = [
-    d.strip()
-    for d in os.environ.get(
-        "EXTRA_TARGET_DOMAINS",
-        "cdn.oaistatic.com,ab.chatgpt.com,auth.openai.com,"
-        "auth0.openai.com,challenges.cloudflare.com",
-    ).split(",")
-    if d.strip()
-]
-
-DEFAULT_HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.environ.get("PROXY_PORT", "8000"))
-DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
-
-# Тела ответов больше этого размера отдаются потоком без rewriting —
-# защита от расхода памяти/CPU на гигантских бандлах.
-MAX_REWRITE_BODY_SIZE = 8 * 1024 * 1024
+from config import (  # noqa: E402
+    BASE_PATH,
+    DEBUG,
+    EXTRA_TARGET_DOMAINS,
+    MAX_REWRITE_BODY_SIZE,
+    PROXY_HOST,
+    PROXY_PORT,
+    TARGET_URL,
+    normalize_base_path,
+)
 
 _parsed_target = urlparse(TARGET_URL)
 TARGET_DOMAIN = _parsed_target.netloc  # host[:port] основного домена
@@ -154,18 +147,25 @@ REWRITE_EXACT_TYPES = {
 _DOMAIN_PREFIX_RE = re.compile(r"^__([A-Za-z0-9.-]+?)__(?=/|$)")
 
 
+Rewriter = tuple[re.Pattern, str | Callable[[re.Match], str]]
+
+
 @lru_cache(maxsize=64)
-def _build_rewriters(http_origin: str, ws_origin: str) -> tuple[tuple[re.Pattern, str], ...]:
+def _build_rewriters(http_origin: str, ws_origin: str) -> tuple[Rewriter, ...]:
     """
     Компилирует набор (regex, замена) для переписывания всех упоминаний
-    целевых доменов. Кэшируется по origin прокси (host:port берётся из
-    заголовка Host запроса, поэтому прокси работает на любом порту).
+    целевых доменов и root-relative URL. Кэшируется по origin прокси
+    (host:port берётся из заголовка Host запроса, поэтому прокси работает
+    на любом порту).
 
-    http_origin — например "http://localhost:8000" (без слэша на конце)
+    http_origin — например "http://localhost:8000" или, в режиме JupyterHub,
+                  "http://localhost:8080/user/login/proxy/8000" (без слэша
+                  на конце; путь в origin — это и есть BASE_PATH)
     ws_origin   — например "ws://localhost:8000"
     """
-    host_only = http_origin.split("://", 1)[-1]  # "localhost:8000"
-    rules: list[tuple[re.Pattern, str]] = []
+    host_only = http_origin.split("://", 1)[-1].split("/", 1)[0]  # "localhost:8000"
+    base_path = urlparse(http_origin).path.rstrip("/")  # "" или "/user/login/proxy/8000"
+    rules: list[Rewriter] = []
 
     def add(pattern: str, repl: str) -> None:
         rules.append((re.compile(pattern, re.IGNORECASE), repl))
@@ -194,19 +194,77 @@ def _build_rewriters(http_origin: str, ws_origin: str) -> tuple[tuple[re.Pattern
         # URL-encoded варианты (IGNORECASE ловит %3a и %3A)
         add(rf"https%3a%2f%2f{d}{boundary}", enc_repl)
         add(rf"http%3a%2f%2f{d}{boundary}", enc_repl)
-        # Protocol-relative: //site.com/... -> //localhost:8000/...
+        # Protocol-relative: //site.com/... -> //host<BASE_PATH>/...
         # (?<!:) не даёт зацепиться за хвост уже заменённого "https://site"
-        add(rf"(?<!:)//{d}{boundary}", "//" + host_only + pref)
-        # «Голый» домен без схемы — только для основного домена: JS-код SPA
-        # часто сверяет location.host === "chatgpt.com". (?<![\w.@-]) не трогает
-        # поддомены (auth.openai.com) и email-адреса (support@chatgpt.com).
+        add(rf"(?<!:)//{d}{boundary}", "//" + host_only + base_path + pref)
+        # «Голый» домен без схемы — только для основного домена: JS-код часто
+        # строит URL конкатенацией ("https://" + host + "/path"). (?<![\w.@-])
+        # не трогает поддомены (auth.openai.com) и email-адреса.
         if domain == TARGET_DOMAIN:
-            add(rf"(?<![\w.@-]){d}{boundary}", host_only)
+            add(rf"(?<![\w.@-]){d}{boundary}", host_only + base_path)
+
+    # --- Root-relative URL ("/wiki/X", "/load.php?...") ---------------------
+    # Смысл появляется только при непустом BASE_PATH: без префикса браузер
+    # и так разрешает их от корня прокси. Замены добавляются в КОНЕЦ списка
+    # (после доменных) и не создают триггерных контекстов друг для друга —
+    # повторного префиксования не возникает.
+    #
+    # Триггеры контекстные: "..." после =/(/:" — поэтому // (protocol-relative),
+    # ://, split("/") и JS-регэкспы вида "/\d+/" не затрагиваются.
+    if base_path:
+        esc_base = base_path.replace("/", "\\/")  # для экранированного JSON
+        # Идемпотентность: URL, уже содержащий базовый путь, не префиксуем повторно
+        not_base = rf"(?!{re.escape(base_path[1:])}(?:/|$))"
+        # Ключ JSON/JS-объекта: "wgArticlePath" или src
+        key = r"(?:[A-Za-z_$][\w$]*|[\"'][A-Za-z_$][\w$. \t-]*[\"'])"
+
+        # HTML-атрибуты: href="/wiki/X", src="/w/load.php?...", action="..."
+        add(
+            r"(\s(?:href|src|action|formaction|poster|background|cite|longdesc"
+            r"|data-src|data-url)\s*=\s*)([\"'])/(?!/)" + not_base,
+            rf"\g<1>\g<2>{base_path}/",
+        )
+
+        # srcset/imagesrcset — список "url дескриптор, url дескриптор, ...":
+        # каждый root-relative кандидат префиксуем отдельно (замена-функция,
+        # а не строка, т.к. кандидатов много и триггер у них — запятая)
+        def _srcset_repl(m: re.Match) -> str:
+            head, quote, value = m.group(1), m.group(2), m.group(3)
+            tokens = []
+            for token in value.split(","):
+                stripped = token.lstrip()
+                if (
+                    stripped.startswith("/")
+                    and not stripped.startswith("//")
+                    and not stripped.startswith(base_path + "/")
+                    and stripped != base_path
+                ):
+                    indent = token[: len(token) - len(stripped)]
+                    token = indent + base_path + stripped
+                tokens.append(token)
+            return head + quote + ",".join(tokens) + quote
+
+        rules.append((
+            re.compile(r"(\s(?:srcset|imagesrcset)\s*=\s*)([\"'])([^\"']*)\2", re.IGNORECASE),
+            _srcset_repl,
+        ))
+
+        # CSS: url(/static/x.png), url('/x'), url("/x")
+        add(r"(url\s*\(\s*([\"'])?)/(?!/)" + not_base, rf"\g<1>{base_path}/")
+        # JS-вызовы, где URL — первый аргумент: fetch("/api"), open("/x"),
+        # import("/mod"), mw.loader.load("/w/load.php?...")
+        add(r"(\b(?:fetch|open|import|load)\s*\(\s*)([\"'])/(?!/)" + not_base, rf"\g<1>\g<2>{base_path}/")
+        # XHR: xhr.open("GET", "/x") — URL вторым аргументом
+        add(r"(\.open\s*\(\s*[\"'][^\"']*[\"']\s*,\s*)([\"'])/(?!/)" + not_base, rf"\g<1>\g<2>{base_path}/")
+        # JSON/JS-объекты: "wgArticlePath": "/wiki/$1", src: "/x"
+        add(rf"({key}\s*:\s*)([\"'])/(?!/)" + not_base, rf"\g<1>\g<2>{base_path}/")
+        # То же с экранированными слэшами: "wgScript":"\/w\/index.php"
+        add(rf'({key}\s*:\s*")\\/(?!/)' + not_base, rf"\g<1>{esc_base}/")
 
     return tuple(rules)
 
 
-def rewrite_text(text: str, rewriters: tuple[tuple[re.Pattern, str], ...]) -> str:
+def rewrite_text(text: str, rewriters: tuple[Rewriter, ...]) -> str:
     for pattern, repl in rewriters:
         text = pattern.sub(repl, text)
     return text
@@ -225,17 +283,24 @@ def is_rewritable(content_type: str | None) -> bool:
     )
 
 
-def configure(target_url: str | None = None, extra_domains: list[str] | None = None) -> None:
+def configure(
+    target_url: str | None = None,
+    extra_domains: list[str] | None = None,
+    base_path: str | None = None,
+) -> None:
     """
-    Переопределяет целевой сайт (и доп. домены) на лету, без перезапуска процесса.
-    Используется прокси-раннером из Jupyter (proxy_runner.start_proxy).
+    Переопределяет целевой сайт (и доп. домены, и базовый путь) на лету,
+    без перезапуска процесса. Используется прокси-раннером из Jupyter
+    (proxy_runner.start_proxy).
 
     extra_domains=None означает «оставить как есть», [] — «отключить доп. домены».
+    base_path=None — оставить BASE_PATH из config.txt/окружения, "" — отключить
+    префикс, "/user/x/proxy/8000" (или полный URL) — включить.
     ВАЖНО: сбрасывает кэш компилятора rewriter'ов — их ключ только origin прокси,
-    а список доменов зашит в сами шаблоны.
+    а список доменов и базовый путь зашиты в сами шаблоны.
     """
     global TARGET_URL, TARGET_DOMAIN, TARGET_SCHEME
-    global EXTRA_TARGET_DOMAINS, ALL_DOMAINS, _EXTRA_SET
+    global EXTRA_TARGET_DOMAINS, ALL_DOMAINS, _EXTRA_SET, BASE_PATH
 
     if target_url:
         TARGET_URL = target_url.rstrip("/")
@@ -245,6 +310,9 @@ def configure(target_url: str | None = None, extra_domains: list[str] | None = N
 
     if extra_domains is not None:
         EXTRA_TARGET_DOMAINS = [d.strip() for d in extra_domains if d.strip()]
+
+    if base_path is not None:
+        BASE_PATH = normalize_base_path(base_path)
 
     _EXTRA_SET = set(EXTRA_TARGET_DOMAINS)
     ALL_DOMAINS = [TARGET_DOMAIN, *EXTRA_TARGET_DOMAINS]
@@ -302,6 +370,12 @@ def rewrite_set_cookie(cookie: str, domain: str, is_main: bool) -> str:
         low = attr.lower()
         if low.startswith("domain=") or low == "secure" or low == "partitioned":
             continue
+        if low.startswith("path="):
+            # В режиме JupyterHub cookie-путь должен включать базовый путь,
+            # иначе браузер не пришлёт cookie на /user/.../proxy/8000/wiki/...
+            cookie_path = attr.split("=", 1)[1].strip()
+            if BASE_PATH and cookie_path.startswith("/") and cookie_path != "/":
+                attr = f"Path={BASE_PATH}{cookie_path}"
         if low.startswith("samesite="):
             value = attr.split("=", 1)[1].strip()
             attr = "SameSite=Lax" if value.lower() == "none" else f"SameSite={value}"
@@ -331,21 +405,36 @@ def resolve_target(path: str) -> tuple[str, str, bool]:
 
 
 def raw_request_path(scope) -> str:
-    """Исходный путь без декодирования %XX — максимальная точность проброса."""
+    """
+    Исходный путь без декодирования %XX — максимальная точность проброса.
+
+    При заданном BASE_PATH uvicorn (root_path) сам подставляет префикс в
+    path/raw_path; если префикс пришёл и в самом запросе (например, nginx
+    его не отрезал), он удваивается — поэтому снимаем циклом. Путь реального
+    сайта (для Википедии) с BASE_PATH пересечься не может.
+    """
     raw = scope.get("raw_path") or scope.get("path", "/").encode()
-    return raw.decode("latin-1").lstrip("/")
+    path = raw.decode("latin-1")
+    while BASE_PATH and (path + "/").startswith(BASE_PATH + "/"):
+        path = path[len(BASE_PATH):]
+    return path.lstrip("/")
 
 
 def proxy_origins(request: Request) -> tuple[str, str]:
     """
     Origin прокси из фактического запроса: берём Host из заголовка клиента
     (а не из сокета), чтобы localhost и 127.0.0.1 не путали cookie-хранилища.
+    Схема — из X-Forwarded-Proto (реальный JupyterHub терминирует TLS),
+    иначе схема самого запроса. При заданном BASE_PATH origin включает
+    префикс: http://host:8080/user/my_login/proxy/8000.
     Возвращает (http_origin, ws_origin).
     """
-    host = request.headers.get("host") or f"{DEFAULT_HOST}:{DEFAULT_PORT}"
-    scheme = request.url.scheme  # "http" для чистого uvicorn
+    host = request.headers.get("host") or f"{PROXY_HOST}:{PROXY_PORT}"
+    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if scheme not in ("http", "https"):
+        scheme = request.url.scheme  # "http" для чистого uvicorn
     ws_scheme = "ws" if scheme == "http" else "wss"
-    return f"{scheme}://{host}", f"{ws_scheme}://{host}"
+    return f"{scheme}://{host}{BASE_PATH}", f"{ws_scheme}://{host}{BASE_PATH}"
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +465,9 @@ app = FastAPI(
     docs_url=None,  # /docs и /openapi.json отключены — эти пути может использовать сам сайт
     redoc_url=None,
     openapi_url=None,
+    # root_path здесь — запасной вариант для запуска "uvicorn main:app" без
+    # --root-path: uvicorn, получив свой root_path, перепишет scope сам.
+    root_path=BASE_PATH,
     lifespan=lifespan,
 )
 
@@ -418,7 +510,11 @@ async def proxy_http(request: Request, path: str) -> Response:
         if low == "origin":
             # Цель ждёт свой origin; localhost тут раскрыл бы проксирование (CSRF-проверки)
             value = value_b.decode("latin-1")
-            if value.rstrip("/") == http_origin:
+            # Браузер шлёт Origin без пути, поэтому сравниваем и с вариантом
+            # без BASE_PATH (http_origin содержит префикс)
+            stripped = value.rstrip("/")
+            bare_origin = http_origin[: -len(BASE_PATH)] if BASE_PATH else http_origin
+            if stripped == http_origin or stripped == bare_origin:
                 value = f"{TARGET_SCHEME if is_main else 'https'}://{domain}"
             fwd.append((key.encode(), value.encode("latin-1")))
             continue
@@ -473,6 +569,10 @@ async def proxy_http(request: Request, path: str) -> Response:
             # Редирект: цель вернула абсолютный URL — переписываем на прокси,
             # относительный оставляем (браузер сам резолвит его от localhost).
             value = rewrite_text(value, rewriters)
+            if BASE_PATH and value.startswith("/") and not value.startswith("//"):
+                # Root-relative Location браузер резолвит от корня хоста,
+                # а в режиме JupyterHub прокси живёт под префиксом
+                value = BASE_PATH + value
         out_headers.append((key_b, value.encode("latin-1")))
 
     no_body = (
@@ -636,7 +736,8 @@ async def proxy_ws(ws: WebSocket, path: str) -> None:
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host=DEFAULT_HOST,
-        port=DEFAULT_PORT,
+        host=PROXY_HOST,
+        port=PROXY_PORT,
+        root_path=BASE_PATH,
         log_level="debug" if DEBUG else "info",
     )
