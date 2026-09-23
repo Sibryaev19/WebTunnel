@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Hue (pseudo) — Home</title></head>
+<body>
+  <h1>Hue (pseudo) — Home. Вы вошли как {{ user.username }}.</h1>
+
+  <p id="status">AJAX session_check: выполняется…</p>
+
+  <form method="post" action="/execute">
+    {% csrf_token %}
+    <label>Query: <input type="text" name="query" value="select 1"></label>
+    <button type="submit">Execute</button>
+  </form>
+
+  <script>
+    // Как реальный HUE: сразу после загрузки страницы UI шлёт AJAX POST
+    // c заголовком X-CSRFToken, взятым из cookie csrftoken.
+    function getCookie(name) {
+      for (const part of document.cookie.split(";")) {
+        const kv = part.trim().split("=");
+        if (kv[0] === name) return decodeURIComponent(kv.slice(1).join("="));
+      }
+      return null;
+    }
+    fetch("/api/session_check", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {"X-CSRFToken": getCookie("{{ csrf_cookie_name }}")}
+    })
+      .then(function (resp) {
+        if (resp.ok) { return resp.json(); }
+        return resp.text().then(function (t) {
+          throw new Error("HTTP " + resp.status + ": " + t.slice(0, 120));
+        });
+      })
+      .then(function (data) {
+        document.getElementById("status").textContent =
+          "AJAX session_check: OK (" + data.user + ")";
+      })
+      .catch(function (err) {
+        document.getElementById("status").textContent =
+          "AJAX session_check: ПРОВАЛ — " + err.message;
+      });
+  </script>
+</body>
+</html>

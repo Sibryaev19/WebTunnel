@@ -1,3 +1,5 @@
 **/__pycache__/
 **/.venv/
 **/.zcode/
+_csrf_lab/db.sqlite3
+_csrf_lab/logs/
