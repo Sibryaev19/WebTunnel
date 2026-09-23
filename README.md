@@ -5,7 +5,11 @@
 доступен из браузера только через прокси-префикс вида
 `https://jupyterhub/user/<login>/proxy/<port>/`.
 
-Умеет: проксирование всех HTTP-методов и WebSocket, прозрачные cookies,
+Умеет: проксирование всех HTTP-методов и WebSocket, прозрачные cookies
+(Secure и имена `__Host-`/`__Secure-` сохраняются при https-доступе через
+JupyterHub; при http-доступе такие cookie переименовываются с обратной
+подстановкой в запросах — иначе браузер их отбрасывает и ломается CSRF-защита
+сайта, например страница «CSRF error» в HUE),
 перехват редиректов, переписывание URL в HTML/JS/CSS/JSON (абсолютные,
 protocol-relative, экранированные, URL-encoded и root-relative ссылки),
 удаление CSP/X-Frame-Options/HSTS.
@@ -19,6 +23,7 @@ protocol-relative, экранированные, URL-encoded и root-relative с
 | `proxy_runner.py` | Запуск/остановка из Jupyter-ноутбука |
 | `config.txt` | Настройки (шаблон, всё закомментировано) |
 | `nginx.conf`, `docker-compose.yml` | Имитация JupyterHub для локальных тестов |
+| `_csrf_lab/` | Лаборатория воспроизведения CSRF/cookie-багов: Django-стенд «псевдо-HUE» (`COOKIE_VARIANT=plain\|secure\|host`) и e2e-скрипт `flow_test.py` |
 
 ## Установка
 

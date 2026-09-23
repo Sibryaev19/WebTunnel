@@ -327,9 +327,41 @@ def cookie_prefix(domain: str) -> str:
     return f"__{domain}__"
 
 
-def filter_request_cookies(raw: str, domain: str, is_main: bool) -> str | None:
+# Префиксы имён __Host- / __Secure- требуют атрибута Secure: без него браузер
+# отбрасывает cookie целиком, и ломается вся CSRF-механика сайта (Django/HUE,
+# Spring и т.д.). Когда браузерская сторона подключена по http, Secure ставить
+# нельзя — поэтому такие cookie переименовываются ("xhost-"/"xsecure-"), а в
+# исходящих запросах имя переводится обратно. На https имена сохраняются
+# как есть, вместе с Secure.
+SECURE_NAME_PREFIXES = {
+    "__host-": "xhost-",
+    "__secure-": "xsecure-",
+}
+# Обратная карта с каноническим регистром: цель ищет cookie с учётом регистра
+_REVERSE_NAME_PREFIXES = {"xhost-": "__Host-", "xsecure-": "__Secure-"}
+
+
+def rename_secure_prefixed(name: str) -> str:
+    low = name.lower()
+    for prefix, replacement in SECURE_NAME_PREFIXES.items():
+        if low.startswith(prefix):
+            return replacement + name[len(prefix):]
+    return name
+
+
+# В http-режиме имена переименованы, поэтому литералы с исходными именами в
+# JS/HTML (getCookie("__Host-csrftoken"), $.cookie('__Secure-x')) тоже
+# переименовываем — иначе сайт не найдёт свою cookie через document.cookie
+# и не пришлёт CSRF-заголовок. Триггер — только строковый литерал.
+_COOKIE_NAME_LITERAL_REWRITERS = tuple(
+    (re.compile(rf"(['\"])({re.escape(prefix)})", re.IGNORECASE), rf"\g<1>{replacement}")
+    for prefix, replacement in SECURE_NAME_PREFIXES.items()
+)
+
+
+def filter_request_cookies(raw: str, domain: str, is_main: bool, secure: bool) -> str | None:
     """
-    Браузер хранит все cookies на одном хосте (localhost), а цельexpects, что
+    Браузер хранит все cookies на одном хосте (localhost), а цель ожидает, что
     каждый домен видит только свои. Решение: cookies доп. доменов живут
     под именами "__<домен>__<имя>".
 
@@ -337,6 +369,10 @@ def filter_request_cookies(raw: str, domain: str, is_main: bool) -> str | None:
       * Запрос к доп. домену       -> пробрасываем только "__<домен>__*",
                                       сняв префикс (иначе CDN получил бы
                                       чужую сессию, а это и утечка, и баг).
+
+    При http-доступе (secure=False) имена, переименованные из-за
+    __Host-/__Secure- (см. SECURE_NAME_PREFIXES), переводятся обратно —
+    цель должна получить исходные имена.
     """
     parts = [p.strip() for p in raw.split(";") if p.strip()]
     if is_main:
@@ -345,30 +381,59 @@ def filter_request_cookies(raw: str, domain: str, is_main: bool) -> str | None:
     else:
         pref = cookie_prefix(domain)
         kept = [p[len(pref):] for p in parts if p.startswith(pref)]
-    return "; ".join(kept) if kept else None
+
+    if secure:
+        return "; ".join(kept) if kept else None
+
+    translated = []
+    for part in kept:
+        name, sep, value = part.partition("=")
+        for short, full in _REVERSE_NAME_PREFIXES.items():
+            if name.startswith(short):
+                name = full + name[len(short):]
+                break
+        translated.append(f"{name}{sep}{value}")
+    return "; ".join(translated) if translated else None
 
 
-def rewrite_set_cookie(cookie: str, domain: str, is_main: bool) -> str:
+def rewrite_set_cookie(cookie: str, domain: str, is_main: bool, secure: bool) -> str:
     """
-    Переписывает Set-Cookie от цели так, чтобы cookie «прижилась» на localhost:
-      * убираем Domain=...      — иначе браузер отвергнет cookie для localhost;
-      * убираем Secure          — у нас http, cookie с Secure просто не сохранится;
-      * SameSite=None -> Lax    — None без Secure браузеры игнорируют;
-      * доп. доменам добавляем префикс имени __<домен>__ (см. filter_request_cookies).
+    Переписывает Set-Cookie от цели так, чтобы cookie «прижилась» на хосте
+    прокси:
+      * убираем Domain=...      — иначе браузер отвергнет cookie для чужого хоста;
+      * Secure                  — сохраняем при https-доступе (браузерская
+        сторона за JupyterHub); при http-доступе убираем, иначе браузер не
+        сохранит cookie вовсе;
+      * SameSite=None -> Lax    — только при http: None без Secure браузеры
+        игнорируют; на https None легален и сохраняется как есть;
+      * доп. доменам добавляем префикс имени __<домен>__ (см.
+        filter_request_cookies), а при http-доступе __Host-/__Secure- имена
+        предварительно переименовываются (см. SECURE_NAME_PREFIXES).
     HttpOnly / Path / Max-Age / Expires сохраняются как есть.
     """
     parts = cookie.split(";")
     name_value = parts[0].strip()
+    name, sep, value = name_value.partition("=")
+    name = name.strip()
 
     if not is_main:
-        name, sep, value = name_value.partition("=")
-        name_value = f"{cookie_prefix(domain)}{name.strip()}{sep}{value}"
+        if not secure:
+            name = rename_secure_prefixed(name)
+        name_value = f"{cookie_prefix(domain)}{name}{sep}{value}"
+    elif not secure:
+        renamed = rename_secure_prefixed(name)
+        if renamed != name:
+            name_value = f"{renamed}{sep}{value}"
 
     attrs: list[str] = []
     for part in parts[1:]:
         attr = part.strip()
         low = attr.lower()
-        if low.startswith("domain=") or low == "secure" or low == "partitioned":
+        if low.startswith("domain="):
+            continue
+        if low in ("secure", "partitioned"):
+            if secure:
+                attrs.append(attr)
             continue
         if low.startswith("path="):
             # В режиме JupyterHub cookie-путь должен включать базовый путь,
@@ -378,7 +443,8 @@ def rewrite_set_cookie(cookie: str, domain: str, is_main: bool) -> str:
                 attr = f"Path={BASE_PATH}{cookie_path}"
         if low.startswith("samesite="):
             value = attr.split("=", 1)[1].strip()
-            attr = "SameSite=Lax" if value.lower() == "none" else f"SameSite={value}"
+            if value.lower() == "none" and not secure:
+                attr = "SameSite=Lax"
         attrs.append(attr)
 
     return "; ".join([name_value, *attrs])
@@ -420,19 +486,28 @@ def raw_request_path(scope) -> str:
     return path.lstrip("/")
 
 
+def request_scheme(request: Request) -> str:
+    """
+    Схема, по которой браузер реально подключился к прокси. Реальный
+    JupyterHub терминирует TLS и передаёт схему в X-Forwarded-Proto;
+    чистый uvicorn — по схеме самого запроса.
+    """
+    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if scheme not in ("http", "https"):
+        scheme = request.url.scheme  # "http" для чистого uvicorn
+    return scheme
+
+
 def proxy_origins(request: Request) -> tuple[str, str]:
     """
     Origin прокси из фактического запроса: берём Host из заголовка клиента
     (а не из сокета), чтобы localhost и 127.0.0.1 не путали cookie-хранилища.
-    Схема — из X-Forwarded-Proto (реальный JupyterHub терминирует TLS),
-    иначе схема самого запроса. При заданном BASE_PATH origin включает
-    префикс: http://host:8080/user/my_login/proxy/8000.
+    Схема — через request_scheme() (X-Forwarded-Proto). При заданном
+    BASE_PATH origin включает префикс: http://host:8080/user/my_login/proxy/8000.
     Возвращает (http_origin, ws_origin).
     """
     host = request.headers.get("host") or f"{PROXY_HOST}:{PROXY_PORT}"
-    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    if scheme not in ("http", "https"):
-        scheme = request.url.scheme  # "http" для чистого uvicorn
+    scheme = request_scheme(request)
     ws_scheme = "ws" if scheme == "http" else "wss"
     return f"{scheme}://{host}{BASE_PATH}", f"{ws_scheme}://{host}{BASE_PATH}"
 
@@ -441,11 +516,23 @@ def proxy_origins(request: Request) -> tuple[str, str]:
 # Приложение
 # ---------------------------------------------------------------------------
 
+class TransparentCookiesClient(httpx.AsyncClient):
+    """
+    Клиент без собственной cookie-банки: при build_request httpx мерджит
+    банку клиента в запрос и перезаписывает присланный браузером заголовок
+    Cookie целиком. Единственный источник cookies для цели — браузер,
+    поэтому _merge_cookies всегда возвращает пустую банку.
+    """
+
+    def _merge_cookies(self, cookies):
+        return httpx.Cookies()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Один клиент на всё приложение: пул соединений, HTTP/2 к цели,
     # редиректы НЕ следуем — отдаём их браузеру с переписанным Location.
-    app.state.client = httpx.AsyncClient(
+    app.state.client = TransparentCookiesClient(
         follow_redirects=False,
         http2=True,
         timeout=httpx.Timeout(connect=15.0, read=600.0, write=120.0, pool=30.0),
@@ -494,6 +581,9 @@ async def proxy_http(request: Request, path: str) -> Response:
 
     http_origin, ws_origin = proxy_origins(request)
     rewriters = _build_rewriters(http_origin, ws_origin)
+    # Браузерская сторона на https (за JupyterHub/nginx)? Тогда cookie можно
+    # и нужно оставлять ровно как отдала цель — с Secure и исходными именами.
+    secure_client = request_scheme(request) == "https"
 
     # --- Заголовки запроса -------------------------------------------------
     fwd: list[tuple[bytes, bytes]] = []
@@ -503,7 +593,9 @@ async def proxy_http(request: Request, path: str) -> Response:
         if low in STRIP_REQUEST_HEADERS:
             continue
         if low == "cookie":
-            filtered = filter_request_cookies(value_b.decode("latin-1"), domain, is_main)
+            filtered = filter_request_cookies(
+                value_b.decode("latin-1"), domain, is_main, secure_client
+            )
             if filtered:
                 fwd.append((b"cookie", filtered.encode("latin-1")))
             continue
@@ -556,7 +648,7 @@ async def proxy_http(request: Request, path: str) -> Response:
     out_headers: list[tuple[bytes, bytes]] = []
     # Set-Cookie может повторяться — обрабатываем каждый отдельно
     for sc in upstream.headers.get_list("set-cookie"):
-        rewritten = rewrite_set_cookie(sc, domain, is_main)
+        rewritten = rewrite_set_cookie(sc, domain, is_main, secure_client)
         out_headers.append((b"set-cookie", rewritten.encode("latin-1")))
         logger.debug("Set-Cookie: %s -> %s", sc, rewritten)
 
@@ -594,7 +686,12 @@ async def proxy_http(request: Request, path: str) -> Response:
             if len(body_bytes) <= MAX_REWRITE_BODY_SIZE:
                 try:
                     text = body_bytes.decode("utf-8")
-                    body_bytes = rewrite_text(text, rewriters).encode("utf-8")
+                    text = rewrite_text(text, rewriters)
+                    if not secure_client:
+                        # __Host-/__Secure- имена переименованы — правим и литералы
+                        for pattern, repl in _COOKIE_NAME_LITERAL_REWRITERS:
+                            text = pattern.sub(repl, text)
+                    body_bytes = text.encode("utf-8")
                 except UnicodeDecodeError:
                     # текстовый Content-Type, но тело не utf-8 — отдаём как есть
                     pass
@@ -647,7 +744,9 @@ async def proxy_ws(ws: WebSocket, path: str) -> None:
 
     cookie_header = ws.headers.get("cookie")
     if cookie_header:
-        filtered = filter_request_cookies(cookie_header, domain, is_main)
+        filtered = filter_request_cookies(
+            cookie_header, domain, is_main, secure=(scheme == "wss")
+        )
         if filtered:
             handshake.append(("Cookie", filtered))
 
